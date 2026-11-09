@@ -15,8 +15,10 @@ Tested on Fedora 43 (GCC 15, Mesa/Intel), Hyprland/Wayland.
    ```sh
    ./setup.sh
    ```
-3. Download the game from <https://archive.org/download/harbor-master-ios>
-   and save it in this folder as `HarborMaster Decrypted.ipa`.
+3. Download **`HarborMaster Decrypted.ipa`** (18.8 MB, MD5 `c4402d076115f657936744390fdc3ee8`)
+   from <https://archive.org/download/harbor-master-ios> into this folder.
+   The other `.ipa` files there (`HarborMaster.ipa`, `HarborFree.ipa`) are
+   different builds and untested.
 4. Play:
    ```sh
    ./play.sh                 # 960x640 window
