@@ -1,0 +1,1708 @@
+diff --git a/src/audio/openal_soft_wrapper/build.rs b/src/audio/openal_soft_wrapper/build.rs
+index d0a2e50..8a25cd3 100644
+--- a/src/audio/openal_soft_wrapper/build.rs
++++ b/src/audio/openal_soft_wrapper/build.rs
+@@ -55,10 +55,6 @@ fn main() {
+         link_search(&openal_soft_out.join("lib64"));
+ 
+         // Some dependencies of OpenAL Soft.
+-        if os.eq_ignore_ascii_case("linux") {
+-            // OpenAL on Linux depends on sndio, needs to be dynamically linked
+-            println!("cargo:rustc-link-lib=dylib=sndio");
+-        }
+         if os.eq_ignore_ascii_case("android") {
+             println!("cargo:rustc-link-lib=dylib=OpenSLES");
+         }
+diff --git a/src/frameworks/core_foundation/cf_url.rs b/src/frameworks/core_foundation/cf_url.rs
+index 4435cc4..2df4eab 100644
+--- a/src/frameworks/core_foundation/cf_url.rs
++++ b/src/frameworks/core_foundation/cf_url.rs
+@@ -16,7 +16,7 @@ use crate::frameworks::core_foundation::cf_string::{
+     CFStringRef,
+ };
+ use crate::frameworks::foundation::ns_string::{
+-    get_static_str, to_rust_string, NSUTF8StringEncoding,
++    from_rust_string, get_static_str, to_rust_string, NSUTF8StringEncoding,
+ };
+ use crate::frameworks::foundation::NSUInteger;
+ use crate::mem::{ConstPtr, MutPtr, Ptr};
+@@ -141,6 +141,51 @@ pub fn CFURLCopyPathExtension(env: &mut Environment, url: CFURLRef) -> CFStringR
+     msg![env; ext copy]
+ }
+ 
++fn CFURLCopyPath(env: &mut Environment, url: CFURLRef) -> CFStringRef {
++    // Apple returns the still-percent-escaped path; NSURL's -path is unescaped.
++    // Identical for the plain bundle/document file URLs early apps use.
++    let path = msg![env; url path];
++    msg![env; path copy]
++}
++
++fn CFURLCreateStringByReplacingPercentEscapes(
++    env: &mut Environment,
++    _allocator: CFAllocatorRef,
++    original: CFStringRef,
++    chars_to_leave_escaped: CFStringRef,
++) -> CFStringRef {
++    // NULL means "unescape nothing"; "" means "unescape everything".
++    if chars_to_leave_escaped.is_null() {
++        return msg![env; original copy];
++    }
++    let leave = to_rust_string(env, chars_to_leave_escaped).into_owned();
++    let src = to_rust_string(env, original).into_owned();
++    let bytes = src.as_bytes();
++    let mut out = Vec::with_capacity(bytes.len());
++    let mut i = 0;
++    while i < bytes.len() {
++        let decoded = (bytes[i] == b'%' && i + 2 < bytes.len())
++            .then(|| std::str::from_utf8(&bytes[i + 1..i + 3]).ok())
++            .flatten()
++            .and_then(|hex| u8::from_str_radix(hex, 16).ok())
++            .filter(|&b| !(b.is_ascii() && leave.contains(b as char)));
++        match decoded {
++            Some(b) => {
++                out.push(b);
++                i += 3;
++            }
++            None => {
++                out.push(bytes[i]);
++                i += 1;
++            }
++        }
++    }
++    match String::from_utf8(out) {
++        Ok(s) => from_rust_string(env, s),
++        Err(_) => Ptr::null(),
++    }
++}
++
+ fn CFURLCopyFileSystemPath(
+     env: &mut Environment,
+     url: CFURLRef,
+@@ -201,6 +246,8 @@ pub const FUNCTIONS: FunctionExports = &[
+     export_c_func!(CFURLCreateWithFileSystemPath(_, _, _, _)),
+     export_c_func!(CFURLCreateWithString(_, _, _)),
+     export_c_func!(CFURLCopyPathExtension(_)),
++    export_c_func!(CFURLCopyPath(_)),
++    export_c_func!(CFURLCreateStringByReplacingPercentEscapes(_, _, _)),
+     export_c_func!(CFURLCopyFileSystemPath(_, _)),
+     export_c_func!(CFURLCreateCopyAppendingPathComponent(_, _, _, _)),
+     export_c_func!(CFURLCreateCopyDeletingLastPathComponent(_, _)),
+diff --git a/src/frameworks/foundation/ns_file_manager.rs b/src/frameworks/foundation/ns_file_manager.rs
+index badfe8d..66df779 100644
+--- a/src/frameworks/foundation/ns_file_manager.rs
++++ b/src/frameworks/foundation/ns_file_manager.rs
+@@ -299,7 +299,11 @@ pub const CLASSES: ClassExports = objc_classes! {
+                           error:(MutPtr<id>)error { // NSError**
+     let contents: id = msg![env; this directoryContentsAtPath:path];
+     if contents == nil && !error.is_null() {
+-        todo!(); // TODO: create an NSError if requested
++        let domain = get_static_str(env, NSCocoaErrorDomain);
++        let err = msg_class![env; NSError alloc];
++        let err = msg![env; err initWithDomain:domain code:NSFileReadNoSuchFileError userInfo:nil];
++        autorelease(env, err);
++        env.mem.write(error, err);
+     }
+     contents
+ }
+diff --git a/src/frameworks/foundation/ns_index_path.rs b/src/frameworks/foundation/ns_index_path.rs
+index 7e57b9e..de68b0e 100644
+--- a/src/frameworks/foundation/ns_index_path.rs
++++ b/src/frameworks/foundation/ns_index_path.rs
+@@ -3,16 +3,95 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+  */
+-//! `NSIndexPath`.
++//! `NSIndexPath`, including the UIKit `row`/`section` additions.
+ 
+-use crate::objc::{objc_classes, ClassExports};
++use super::{NSComparisonResult, NSOrderedAscending, NSOrderedDescending, NSOrderedSame};
++use super::{NSInteger, NSUInteger};
++use crate::objc::{
++    autorelease, id, msg, objc_classes, retain, ClassExports, HostObject, NSZonePtr,
++};
++use crate::Environment;
++
++#[derive(Default)]
++struct NSIndexPathHostObject {
++    indexes: Vec<NSUInteger>,
++}
++impl HostObject for NSIndexPathHostObject {}
++
++fn indexes(env: &Environment, path: id) -> &[NSUInteger] {
++    &env.objc.borrow::<NSIndexPathHostObject>(path).indexes
++}
+ 
+ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ (env, this, _cmd);
+ 
+ @implementation NSIndexPath: NSObject
+-// TODO
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::<NSIndexPathHostObject>::default();
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
+++ (id)indexPathWithIndex:(NSUInteger)index {
++    let new: id = msg![env; this alloc];
++    env.objc.borrow_mut::<NSIndexPathHostObject>(new).indexes = vec![index];
++    autorelease(env, new)
++}
++
++// UIKit addition (UITableView)
+++ (id)indexPathForRow:(NSUInteger)row inSection:(NSUInteger)section {
++    let new: id = msg![env; this alloc];
++    env.objc.borrow_mut::<NSIndexPathHostObject>(new).indexes = vec![section, row];
++    autorelease(env, new)
++}
++
++- (NSUInteger)length {
++    indexes(env, this).len() as NSUInteger
++}
++
++- (NSUInteger)indexAtPosition:(NSUInteger)position {
++    indexes(env, this)[position as usize]
++}
++
++// UIKit addition (UITableView)
++- (NSInteger)section {
++    indexes(env, this)[0] as NSInteger
++}
++
++// UIKit addition (UITableView)
++- (NSInteger)row {
++    indexes(env, this)[1] as NSInteger
++}
++
++- (NSComparisonResult)compare:(id)other { // NSIndexPath*
++    match indexes(env, this).cmp(indexes(env, other)) {
++        std::cmp::Ordering::Less => NSOrderedAscending,
++        std::cmp::Ordering::Equal => NSOrderedSame,
++        std::cmp::Ordering::Greater => NSOrderedDescending,
++    }
++}
++
++- (bool)isEqual:(id)other {
++    if this == other {
++        return true;
++    }
++    let class = env.objc.get_known_class("NSIndexPath", &mut env.mem);
++    let is_index_path: bool = msg![env; other isKindOfClass:class];
++    is_index_path && indexes(env, this) == indexes(env, other)
++}
++
++- (NSUInteger)hash {
++    indexes(env, this)
++        .iter()
++        .fold(17u32, |acc, &i| acc.wrapping_mul(31).wrapping_add(i))
++}
++
++// Immutable, so copies can share the object.
++- (id)copyWithZone:(NSZonePtr)_zone {
++    retain(env, this)
++}
++
+ @end
+ 
+ };
+diff --git a/src/frameworks/foundation/ns_thread.rs b/src/frameworks/foundation/ns_thread.rs
+index dddd8cc..0e2910b 100644
+--- a/src/frameworks/foundation/ns_thread.rs
++++ b/src/frameworks/foundation/ns_thread.rs
+@@ -44,6 +44,7 @@ struct NSThreadHostObject {
+     finished: bool,
+     stack_size: NSUInteger,
+     tolerate_type_mismatch: bool,
++    cancelled: bool,
+ }
+ impl HostObject for NSThreadHostObject {}
+ 
+@@ -63,6 +64,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+         finished: false,
+         stack_size: Mem::SECONDARY_THREAD_DEFAULT_STACK_SIZE,
+         tolerate_type_mismatch: false,
++        cancelled: false,
+     });
+     env.objc.alloc_object(this, host_object, &mut env.mem)
+ }
+@@ -150,6 +152,9 @@ pub const CLASSES: ClassExports = objc_classes! {
+     pthread_attr_setdetachstate(env, attr, PTHREAD_CREATE_DETACHED);
+     let thread_ptr: MutPtr<pthread_t> = env.mem.alloc(guest_size_of::<pthread_t>()).cast();
+ 
++    // Like Apple's, a running thread keeps its NSThread alive until it exits,
++    // so apps may release (e.g. after -cancel) while it's still running.
++    retain(env, this);
+     pthread_create(env, thread_ptr, attr.cast_const(), gf, this.cast());
+ 
+     let pthread = env.mem.read(thread_ptr);
+@@ -221,9 +226,13 @@ pub const CLASSES: ClassExports = objc_classes! {
+     env.objc.borrow::<NSThreadHostObject>(this).finished
+ }
+ 
++// Like Apple's, this only sets a flag; the thread checks it and exits itself.
++- (())cancel {
++    env.objc.borrow_mut::<NSThreadHostObject>(this).cancelled = true;
++}
++
+ - (bool)isCancelled {
+-    log_dbg!("TODO: [(NSThread *){:?} isCancelled]", this);
+-    false
++    env.objc.borrow::<NSThreadHostObject>(this).cancelled
+ }
+ 
+ - (())dealloc {
+@@ -274,6 +283,8 @@ pub fn _touchHLE_NSThreadInvocationHelper(env: &mut Environment, ns_thread_obj:
+         // e.g. created with `detachNewThreadSelector:toTarget:withObject:`
+         release(env, ns_thread_obj);
+     }
++    // Balances the retain in -start.
++    release(env, ns_thread_obj);
+ 
+     // TODO: NSThread exit
+ }
+diff --git a/src/frameworks/system_configuration/sc_network_reachability.rs b/src/frameworks/system_configuration/sc_network_reachability.rs
+index 463880d..56ec9c8 100644
+--- a/src/frameworks/system_configuration/sc_network_reachability.rs
++++ b/src/frameworks/system_configuration/sc_network_reachability.rs
+@@ -165,9 +165,33 @@ fn SCNetworkReachabilitySetCallback(
+     false
+ }
+ 
++// Callbacks are never delivered (see SetCallback), so scheduling is a no-op
++// that reports failure, consistent with SetCallback returning FALSE.
++fn SCNetworkReachabilityScheduleWithRunLoop(
++    _env: &mut Environment,
++    target: SCNetworkReachabilityRef,
++    run_loop: CFTypeRef,
++    _mode: CFTypeRef,
++) -> bool {
++    log!("TODO: SCNetworkReachabilityScheduleWithRunLoop({:?}, {:?}) -> FALSE", target, run_loop);
++    false
++}
++
++fn SCNetworkReachabilityUnscheduleFromRunLoop(
++    _env: &mut Environment,
++    target: SCNetworkReachabilityRef,
++    run_loop: CFTypeRef,
++    _mode: CFTypeRef,
++) -> bool {
++    log!("TODO: SCNetworkReachabilityUnscheduleFromRunLoop({:?}, {:?}) -> FALSE", target, run_loop);
++    false
++}
++
+ pub const FUNCTIONS: FunctionExports = &[
+     export_c_func!(SCNetworkReachabilityCreateWithName(_, _)),
+     export_c_func!(SCNetworkReachabilityCreateWithAddress(_, _)),
+     export_c_func!(SCNetworkReachabilityGetFlags(_, _)),
+     export_c_func!(SCNetworkReachabilitySetCallback(_, _, _)),
++    export_c_func!(SCNetworkReachabilityScheduleWithRunLoop(_, _, _)),
++    export_c_func!(SCNetworkReachabilityUnscheduleFromRunLoop(_, _, _)),
+ ];
+diff --git a/src/frameworks/uikit.rs b/src/frameworks/uikit.rs
+index c8e6773..78ca91f 100644
+--- a/src/frameworks/uikit.rs
++++ b/src/frameworks/uikit.rs
+@@ -64,11 +64,14 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         ui_view::ui_page_control::CLASSES,
+         ui_view::ui_picker_view::CLASSES,
+         ui_view::ui_scroll_view::CLASSES,
++        ui_view::ui_scroll_view::ui_table_view::CLASSES,
+         ui_view::ui_scroll_view::ui_text_view::CLASSES,
++        ui_view::ui_table_view_cell::CLASSES,
+         ui_view::ui_web_view::CLASSES,
+         ui_view::ui_window::CLASSES,
+         ui_view_controller::CLASSES,
+         ui_view_controller::ui_navigation_controller::CLASSES,
++        ui_view_controller::ui_table_view_controller::CLASSES,
+     ],
+     constant_exports: &[
+         ui_application::CONSTANTS,
+@@ -169,5 +172,7 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
+         }
+     }
+ 
++    ui_view::run_pending_layouts(env);
++
+     ui_accelerometer::handle_accelerometer(env)
+ }
+diff --git a/src/frameworks/uikit/ui_view.rs b/src/frameworks/uikit/ui_view.rs
+index b4dc3af..6c98daf 100644
+--- a/src/frameworks/uikit/ui_view.rs
++++ b/src/frameworks/uikit/ui_view.rs
+@@ -15,6 +15,7 @@ pub mod ui_label;
+ pub mod ui_page_control;
+ pub mod ui_picker_view;
+ pub mod ui_scroll_view;
++pub mod ui_table_view_cell;
+ pub mod ui_web_view;
+ pub mod ui_window;
+ 
+@@ -70,10 +71,39 @@ const UIViewAnimationCurveLinear: UIViewAnimationCurve = 3;
+ pub struct State {
+     /// List of views for internal purposes. Non-retaining!
+     pub(super) views: Vec<id>,
++    /// Views marked by `setNeedsLayout`, laid out on the next run loop
++    /// iteration by [run_pending_layouts]. Non-retaining (dealloc removes).
++    needs_layout: Vec<id>,
+     pub ui_window: ui_window::State,
+     pub animation_block_count: usize,
+ }
+ 
++/// For use by the run loop: performs UIKit's deferred layout pass, sending
++/// `layoutSubviews` to every view marked with `setNeedsLayout` since the last
++/// pass (views added to a hierarchy, resized views, explicit requests).
++/// Without this, views created after launch would never be laid out, e.g.
++/// the classic `EAGLView` that creates its framebuffer in `layoutSubviews`.
++pub fn run_pending_layouts(env: &mut Environment) {
++    // Layout can mark further views, so loop until settled (bounded, in case
++    // an app re-marks itself from inside its own layoutSubviews).
++    for _ in 0..8 {
++        let pending = std::mem::take(&mut env.framework_state.uikit.ui_view.needs_layout);
++        if pending.is_empty() {
++            return;
++        }
++        for view in pending {
++            () = msg![env; view layoutSubviews];
++        }
++    }
++}
++
++fn set_needs_layout(env: &mut Environment, view: id) {
++    let pending = &mut env.framework_state.uikit.ui_view.needs_layout;
++    if !pending.contains(&view) {
++        pending.push(view);
++    }
++}
++
+ pub(super) struct UIViewHostObject {
+     /// CALayer or subclass.
+     layer: id,
+@@ -448,6 +478,22 @@ pub const CLASSES: ClassExports = objc_classes! {
+     // nothing.
+ }
+ 
++- (())didMoveToSuperview {
++    // Default implementation does nothing; subclasses override it.
++}
++
++- (())setNeedsLayout {
++    set_needs_layout(env, this);
++}
++
++- (())layoutIfNeeded {
++    let pending = &mut env.framework_state.uikit.ui_view.needs_layout;
++    if let Some(i) = pending.iter().position(|&v| v == this) {
++        pending.remove(i);
++        () = msg![env; this layoutSubviews];
++    }
++}
++
+ - (id)superview {
+     env.objc.borrow::<UIViewHostObject>(this).superview
+ }
+@@ -498,6 +544,9 @@ pub const CLASSES: ClassExports = objc_classes! {
+         this_obj.subviews.push(view);
+         let this_layer = this_obj.layer;
+         () = msg![env; this_layer addSublayer:subview_layer];
++        () = msg![env; view didMoveToSuperview];
++        set_needs_layout(env, view);
++        set_needs_layout(env, this);
+     }
+ }
+ 
+@@ -520,6 +569,9 @@ pub const CLASSES: ClassExports = objc_classes! {
+ 
+     assert!(index >= 0);
+     () = msg![env; this_layer insertSublayer:subview_layer atIndex:(index as u32)];
++    () = msg![env; view didMoveToSuperview];
++    set_needs_layout(env, view);
++    set_needs_layout(env, this);
+ }
+ 
+ - (())insertSubview:(id)view belowSubview:(id)sibling {
+@@ -542,6 +594,9 @@ pub const CLASSES: ClassExports = objc_classes! {
+     subviews.insert(idx, view);
+ 
+     () = msg![env; this_layer insertSublayer:subview_layer below:sibling_layer];
++    () = msg![env; view didMoveToSuperview];
++    set_needs_layout(env, view);
++    set_needs_layout(env, this);
+ }
+ 
+ - (())bringSubviewToFront:(id)subview {
+@@ -639,6 +694,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+     state.swap_remove(
+         state.iter().position(|&v| v == this).unwrap()
+     );
++    env.framework_state.uikit.ui_view.needs_layout.retain(|&v| v != this);
+ 
+     env.objc.dealloc_object(this, &mut env.mem);
+ }
+@@ -724,7 +780,11 @@ pub const CLASSES: ClassExports = objc_classes! {
+ }
+ - (())setBounds:(CGRect)bounds {
+     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+-    msg![env; layer setBounds:bounds]
++    let old: CGRect = msg![env; layer bounds];
++    () = msg![env; layer setBounds:bounds];
++    if old.size != bounds.size {
++        set_needs_layout(env, this);
++    }
+ }
+ - (CGPoint)center {
+     // FIXME: what happens if [layer anchorPoint] isn't (0.5, 0.5)?
+@@ -741,7 +801,12 @@ pub const CLASSES: ClassExports = objc_classes! {
+ }
+ - (())setFrame:(CGRect)frame {
+     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+-    msg![env; layer setFrame:frame]
++    let old: CGRect = msg![env; layer bounds];
++    () = msg![env; layer setFrame:frame];
++    let new: CGRect = msg![env; layer bounds];
++    if old.size != new.size {
++        set_needs_layout(env, this);
++    }
+ }
+ - (CGAffineTransform)transform {
+     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+diff --git a/src/frameworks/uikit/ui_view/ui_control/ui_button.rs b/src/frameworks/uikit/ui_view/ui_control/ui_button.rs
+index dec8a96..eae09f2 100644
+--- a/src/frameworks/uikit/ui_view/ui_control/ui_button.rs
++++ b/src/frameworks/uikit/ui_view/ui_control/ui_button.rs
+@@ -6,7 +6,7 @@
+ //! `UIButton`.
+ 
+ use super::{UIControlState, UIControlStateNormal};
+-use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect};
++use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
+ use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str, to_rust_string};
+ use crate::frameworks::foundation::NSInteger;
+ use crate::frameworks::uikit::ui_font::UITextAlignmentCenter;
+@@ -89,6 +89,8 @@ fn update(env: &mut Environment, this: id) {
+     let background_image_view: id = msg![env; this backgroundImageView];
+     let background_image: id = msg![env; this currentBackgroundImage];
+     () = msg![env; background_image_view setImage:background_image];
++
++    () = msg![env; this setNeedsLayout];
+ }
+ 
+ fn init_common(env: &mut Environment, this: id) -> id {
+@@ -250,14 +252,33 @@ pub const CLASSES: ClassExports = objc_classes! {
+ }
+ 
+ - (())layoutSubviews {
+-    let label = env.objc.borrow_mut::<UIButtonHostObject>(this).title_label;
+-    let background_image_view = env.objc.borrow_mut::<UIButtonHostObject>(this).background_image_view;
++    let &UIButtonHostObject { title_label: label, image_view, background_image_view, .. } =
++        env.objc.borrow(this);
+     let bounds: CGRect = msg![env; this bounds];
+ 
+     () = msg![env; background_image_view setFrame:bounds];
+     () = msg![env; label setFrame:bounds];
+-    // TODO: layout for image
+ 
++    // The foreground image keeps its natural size (shrunk to fit if needed)
++    // and is centered, as for an image-only UIButtonTypeCustom.
++    let image: id = msg![env; image_view image];
++    let frame = if image == nil {
++        CGRect::default()
++    } else {
++        let size: CGSize = msg![env; image size];
++        let scale = (bounds.size.width / size.width)
++            .min(bounds.size.height / size.height)
++            .min(1.0);
++        let (w, h) = (size.width * scale, size.height * scale);
++        CGRect {
++            origin: CGPoint {
++                x: (bounds.size.width - w) / 2.0,
++                y: (bounds.size.height - h) / 2.0,
++            },
++            size: CGSize { width: w, height: h },
++        }
++    };
++    () = msg![env; image_view setFrame:frame];
+ }
+ 
+ - (UIButtonType)buttonType {
+diff --git a/src/frameworks/uikit/ui_view/ui_image_view.rs b/src/frameworks/uikit/ui_view/ui_image_view.rs
+index c6fd293..f75f2f7 100644
+--- a/src/frameworks/uikit/ui_view/ui_image_view.rs
++++ b/src/frameworks/uikit/ui_view/ui_image_view.rs
+@@ -8,7 +8,7 @@
+ use crate::frameworks::core_graphics::cg_image::CGImageRef;
+ use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+ use crate::frameworks::foundation::ns_string::get_static_str;
+-use crate::frameworks::foundation::NSTimeInterval;
++use crate::frameworks::foundation::{NSInteger, NSTimeInterval};
+ use crate::objc::{
+     id, impl_HostObject_with_superclass, msg, msg_super, objc_classes, release, retain,
+     todo_objc_setter, ClassExports, NSZonePtr,
+@@ -102,6 +102,10 @@ pub const CLASSES: ClassExports = objc_classes! {
+     todo_objc_setter!(this, duration);
+ }
+ 
++- (())setAnimationRepeatCount:(NSInteger)count {
++    todo_objc_setter!(this, count);
++}
++
+ - (())startAnimating {
+     log!("TODO: [(UIImageView*) {:?} startAnimating]", this);
+ }
+diff --git a/src/frameworks/uikit/ui_view/ui_scroll_view.rs b/src/frameworks/uikit/ui_view/ui_scroll_view.rs
+index 92b3274..5cc8755 100644
+--- a/src/frameworks/uikit/ui_view/ui_scroll_view.rs
++++ b/src/frameworks/uikit/ui_view/ui_scroll_view.rs
+@@ -5,6 +5,7 @@
+  */
+ //! `UIScrollView`.
+ 
++pub mod ui_table_view;
+ pub mod ui_text_view;
+ use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+ use crate::frameworks::foundation::NSInteger;
+@@ -91,6 +92,10 @@ pub const CLASSES: ClassExports = objc_classes! {
+     todo_objc_setter!(this, value);
+ }
+ 
++- (())flashScrollIndicators {
++    // Scroll indicators aren't drawn, so there is nothing to flash.
++}
++
+ - (CGPoint)contentOffset {
+     env.objc.borrow::<UIScrollViewHostObject>(this).content_offset
+ }
+diff --git a/src/frameworks/uikit/ui_view/ui_scroll_view/ui_table_view.rs b/src/frameworks/uikit/ui_view/ui_scroll_view/ui_table_view.rs
+new file mode 100644
+index 0000000..e50e793
+--- /dev/null
++++ b/src/frameworks/uikit/ui_view/ui_scroll_view/ui_table_view.rs
+@@ -0,0 +1,625 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `UITableView`.
++//!
++//! A deliberately simple implementation: every row's cell is created on
++//! `reloadData` (no cell reuse, `dequeueReusableCellWithIdentifier:` always
++//! returns nil, which apps must handle anyway), rows are stacked vertically
++//! inside the scroll view's content, and a touch that ends without dragging
++//! selects the row it started on.
++
++use super::UIScrollViewHostObject;
++use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
++use crate::frameworks::foundation::{ns_array, NSInteger, NSUInteger};
++use crate::frameworks::uikit::ui_view::ui_table_view_cell::DEFAULT_ROW_HEIGHT;
++use crate::objc::{
++    autorelease, id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil,
++    objc_classes, release, retain, todo_objc_setter, ClassExports, NSZonePtr, SEL,
++};
++use crate::Environment;
++
++type UITableViewStyle = NSInteger;
++const UITableViewStylePlain: UITableViewStyle = 0;
++
++type UITableViewScrollPosition = NSInteger;
++const UITableViewScrollPositionNone: UITableViewScrollPosition = 0;
++const UITableViewScrollPositionTop: UITableViewScrollPosition = 1;
++const UITableViewScrollPositionMiddle: UITableViewScrollPosition = 2;
++const UITableViewScrollPositionBottom: UITableViewScrollPosition = 3;
++
++/// Finger movement (in points) after which a touch counts as a drag, not a tap.
++const TAP_SLOP: CGFloat = 10.0;
++
++struct Row {
++    section: NSUInteger,
++    row: NSUInteger,
++    y: CGFloat,
++    height: CGFloat,
++    /// `UITableViewCell*`, strong
++    cell: id,
++}
++
++pub struct UITableViewHostObject {
++    superclass: UIScrollViewHostObject,
++    style: UITableViewStyle,
++    /// UITableViewDataSource, weak reference
++    data_source: id,
++    row_height: CGFloat,
++    section_header_height: CGFloat,
++    section_footer_height: CGFloat,
++    /// The following three are strong references.
++    header_view: id,
++    footer_view: id,
++    background_view: id,
++    rows: Vec<Row>,
++    /// Section header/footer views from the delegate, strong references.
++    section_views: Vec<id>,
++    selected: Option<(NSUInteger, NSUInteger)>,
++    allows_selection: bool,
++    loaded: bool,
++    touch_start: CGPoint,
++    touch_moved: bool,
++}
++impl_HostObject_with_superclass!(UITableViewHostObject);
++impl Default for UITableViewHostObject {
++    fn default() -> Self {
++        UITableViewHostObject {
++            superclass: Default::default(),
++            style: UITableViewStylePlain,
++            data_source: nil,
++            row_height: DEFAULT_ROW_HEIGHT,
++            section_header_height: 0.0,
++            section_footer_height: 0.0,
++            header_view: nil,
++            footer_view: nil,
++            background_view: nil,
++            rows: Vec::new(),
++            section_views: Vec::new(),
++            selected: None,
++            allows_selection: true,
++            loaded: false,
++            touch_start: CGPoint { x: 0.0, y: 0.0 },
++            touch_moved: false,
++        }
++    }
++}
++
++fn host(env: &mut Environment, table: id) -> &mut UITableViewHostObject {
++    env.objc.borrow_mut::<UITableViewHostObject>(table)
++}
++
++fn responds(env: &mut Environment, obj: id, selector: &str) -> bool {
++    if obj == nil {
++        return false;
++    }
++    let sel: SEL = env
++        .objc
++        .register_host_selector(selector.to_string(), &mut env.mem);
++    msg![env; obj respondsToSelector:sel]
++}
++
++fn index_path(env: &mut Environment, section: NSUInteger, row: NSUInteger) -> id {
++    msg_class![env; NSIndexPath indexPathForRow:row inSection:section]
++}
++
++fn index_path_parts(env: &mut Environment, path: id) -> (NSUInteger, NSUInteger) {
++    let section: NSInteger = msg![env; path section];
++    let row: NSInteger = msg![env; path row];
++    (section as NSUInteger, row as NSUInteger)
++}
++
++fn find_row(env: &mut Environment, this: id, section: NSUInteger, row: NSUInteger) -> Option<usize> {
++    host(env, this)
++        .rows
++        .iter()
++        .position(|r| r.section == section && r.row == row)
++}
++
++fn width(env: &mut Environment, this: id) -> CGFloat {
++    let bounds: CGRect = msg![env; this bounds];
++    bounds.size.width
++}
++
++/// Keeps the background view filling the visible area, behind everything.
++fn pin_background(env: &mut Environment, this: id) {
++    let background = host(env, this).background_view;
++    if background == nil {
++        return;
++    }
++    let bounds: CGRect = msg![env; this bounds];
++    () = msg![env; background setFrame:bounds];
++    () = msg![env; this sendSubviewToBack:background];
++}
++
++fn clear_content(env: &mut Environment, this: id) {
++    let rows = std::mem::take(&mut host(env, this).rows);
++    let section_views = std::mem::take(&mut host(env, this).section_views);
++    for view in rows.into_iter().map(|r| r.cell).chain(section_views) {
++        () = msg![env; view removeFromSuperview];
++        release(env, view);
++    }
++}
++
++/// Asks the delegate for a section header/footer view and places it.
++fn add_section_view(
++    env: &mut Environment,
++    this: id,
++    section: NSUInteger,
++    y: &mut CGFloat,
++    is_header: bool,
++) {
++    let delegate: id = msg![env; this delegate];
++    let (height_sel, view_sel, default_height) = if is_header {
++        (
++            "tableView:heightForHeaderInSection:",
++            "tableView:viewForHeaderInSection:",
++            host(env, this).section_header_height,
++        )
++    } else {
++        (
++            "tableView:heightForFooterInSection:",
++            "tableView:viewForFooterInSection:",
++            host(env, this).section_footer_height,
++        )
++    };
++    let section = section as NSInteger;
++    let height: CGFloat = if !responds(env, delegate, height_sel) {
++        default_height
++    } else if is_header {
++        msg![env; delegate tableView:this heightForHeaderInSection:section]
++    } else {
++        msg![env; delegate tableView:this heightForFooterInSection:section]
++    };
++    let view: id = if !responds(env, delegate, view_sel) {
++        nil
++    } else if is_header {
++        msg![env; delegate tableView:this viewForHeaderInSection:section]
++    } else {
++        msg![env; delegate tableView:this viewForFooterInSection:section]
++    };
++    if view != nil {
++        retain(env, view);
++        let frame = CGRect {
++            origin: CGPoint { x: 0.0, y: *y },
++            size: CGSize { width: width(env, this), height },
++        };
++        () = msg![env; view setFrame:frame];
++        () = msg![env; this addSubview:view];
++        host(env, this).section_views.push(view);
++    }
++    *y += height;
++}
++
++fn place_full_width(env: &mut Environment, this: id, view: id, y: &mut CGFloat) {
++    if view == nil {
++        return;
++    }
++    let mut frame: CGRect = msg![env; view frame];
++    frame.origin = CGPoint { x: 0.0, y: *y };
++    frame.size.width = width(env, this);
++    () = msg![env; view setFrame:frame];
++    () = msg![env; this addSubview:view];
++    *y += frame.size.height;
++}
++
++fn reload(env: &mut Environment, this: id) {
++    clear_content(env, this);
++    host(env, this).loaded = true;
++
++    let data_source = host(env, this).data_source;
++    let delegate: id = msg![env; this delegate];
++    let table_width = width(env, this);
++    let mut y: CGFloat = 0.0;
++
++    let header_view = host(env, this).header_view;
++    place_full_width(env, this, header_view, &mut y);
++
++    let sections: NSInteger = if data_source == nil {
++        0
++    } else if responds(env, data_source, "numberOfSectionsInTableView:") {
++        msg![env; data_source numberOfSectionsInTableView:this]
++    } else {
++        1
++    };
++    let custom_heights = responds(env, delegate, "tableView:heightForRowAtIndexPath:");
++    let will_display = responds(env, delegate, "tableView:willDisplayCell:forRowAtIndexPath:");
++    let selected = host(env, this).selected;
++
++    for section in 0..(sections.max(0) as NSUInteger) {
++        add_section_view(env, this, section, &mut y, true);
++        let rows: NSInteger =
++            msg![env; data_source tableView:this numberOfRowsInSection:(section as NSInteger)];
++        for row in 0..(rows.max(0) as NSUInteger) {
++            let path = index_path(env, section, row);
++            let height: CGFloat = if custom_heights {
++                msg![env; delegate tableView:this heightForRowAtIndexPath:path]
++            } else {
++                host(env, this).row_height
++            };
++            let cell: id = msg![env; data_source tableView:this cellForRowAtIndexPath:path];
++            assert!(cell != nil, "tableView:cellForRowAtIndexPath: returned nil");
++            retain(env, cell);
++            let frame = CGRect {
++                origin: CGPoint { x: 0.0, y },
++                size: CGSize { width: table_width, height },
++            };
++            () = msg![env; cell setFrame:frame];
++            if selected == Some((section, row)) {
++                () = msg![env; cell setSelected:true animated:false];
++            }
++            if will_display {
++                () = msg![env; delegate tableView:this willDisplayCell:cell forRowAtIndexPath:path];
++            }
++            () = msg![env; this addSubview:cell];
++            host(env, this).rows.push(Row { section, row, y, height, cell });
++            y += height;
++        }
++        add_section_view(env, this, section, &mut y, false);
++    }
++
++    let footer_view = host(env, this).footer_view;
++    place_full_width(env, this, footer_view, &mut y);
++
++    let content_size = CGSize { width: table_width, height: y };
++    () = msg![env; this setContentSize:content_size];
++
++    // Keep the current scroll position valid for the new content.
++    let bounds: CGRect = msg![env; this bounds];
++    let offset: CGPoint = msg![env; this contentOffset];
++    let max_y = (content_size.height - bounds.size.height).max(0.0);
++    if offset.y > max_y {
++        () = msg![env; this setContentOffset:(CGPoint { x: offset.x, y: max_y })];
++    }
++    pin_background(env, this);
++}
++
++fn ensure_loaded(env: &mut Environment, this: id) {
++    if !host(env, this).loaded {
++        reload(env, this);
++    }
++}
++
++/// Re-lays out after a header/footer change, if rows were already built.
++fn relayout_if_loaded(env: &mut Environment, this: id) {
++    if host(env, this).loaded {
++        reload(env, this);
++    }
++}
++
++fn set_selected(env: &mut Environment, this: id, new: Option<(NSUInteger, NSUInteger)>) {
++    let old = std::mem::replace(&mut host(env, this).selected, new);
++    if old == new {
++        return;
++    }
++    if let Some((section, row)) = old {
++        if let Some(i) = find_row(env, this, section, row) {
++            let cell = host(env, this).rows[i].cell;
++            () = msg![env; cell setSelected:false animated:false];
++        }
++    }
++    if let Some((section, row)) = new {
++        if let Some(i) = find_row(env, this, section, row) {
++            let cell = host(env, this).rows[i].cell;
++            () = msg![env; cell setSelected:true animated:false];
++        }
++    }
++}
++
++fn scroll_to_row(env: &mut Environment, this: id, index: usize, position: UITableViewScrollPosition) {
++    let (row_y, row_height) = {
++        let row = &host(env, this).rows[index];
++        (row.y, row.height)
++    };
++    let bounds: CGRect = msg![env; this bounds];
++    let content_size: CGSize = msg![env; this contentSize];
++    let visible = bounds.size.height;
++    let current = bounds.origin.y;
++    let target = match position {
++        UITableViewScrollPositionTop => row_y,
++        UITableViewScrollPositionMiddle => row_y - (visible - row_height) / 2.0,
++        UITableViewScrollPositionBottom => row_y + row_height - visible,
++        // "None": scroll the minimum amount needed to make the row visible.
++        _ if row_y < current => row_y,
++        _ if row_y + row_height > current + visible => row_y + row_height - visible,
++        _ => current,
++    };
++    let target = target.min(content_size.height - visible).max(0.0);
++    if target != current {
++        () = msg![env; this setContentOffset:(CGPoint { x: bounds.origin.x, y: target })];
++    }
++}
++
++/// Handles a tap on the cell containing `view`, like a real user selection.
++fn tap(env: &mut Environment, this: id, view: id) {
++    // Walk up from the touched view to the cell that is our direct subview.
++    let mut view = view;
++    while view != nil {
++        let superview: id = msg![env; view superview];
++        if superview == this {
++            break;
++        }
++        view = superview;
++    }
++    let Some(index) = host(env, this).rows.iter().position(|r| r.cell == view) else {
++        return;
++    };
++    let (section, row) = {
++        let r = &host(env, this).rows[index];
++        (r.section, r.row)
++    };
++    let delegate: id = msg![env; this delegate];
++    let mut path = index_path(env, section, row);
++    if responds(env, delegate, "tableView:willSelectRowAtIndexPath:") {
++        path = msg![env; delegate tableView:this willSelectRowAtIndexPath:path];
++        if path == nil {
++            return;
++        }
++    }
++    let new = index_path_parts(env, path);
++    let old = host(env, this).selected;
++    if let Some((old_section, old_row)) = old.filter(|&o| o != new) {
++        set_selected(env, this, None);
++        if responds(env, delegate, "tableView:didDeselectRowAtIndexPath:") {
++            let old_path = index_path(env, old_section, old_row);
++            () = msg![env; delegate tableView:this didDeselectRowAtIndexPath:old_path];
++        }
++    }
++    set_selected(env, this, Some(new));
++    if responds(env, delegate, "tableView:didSelectRowAtIndexPath:") {
++        () = msg![env; delegate tableView:this didSelectRowAtIndexPath:path];
++    }
++}
++
++fn touch_location(env: &mut Environment, this: id, touches: id) -> (id, CGPoint) {
++    let touch_arr: id = msg![env; touches allObjects];
++    let touch: id = msg![env; touch_arr objectAtIndex:0u32];
++    // Measure in the superview's space so scrolling doesn't skew the distance.
++    let superview: id = msg![env; this superview];
++    let reference = if superview != nil { superview } else { this };
++    let location: CGPoint = msg![env; touch locationInView:reference];
++    (touch, location)
++}
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation UITableView: UIScrollView
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::<UITableViewHostObject>::default();
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++- (id)initWithFrame:(CGRect)frame style:(UITableViewStyle)style {
++    let this: id = msg_super![env; this initWithFrame:frame];
++    host(env, this).style = style;
++    let white: id = msg_class![env; UIColor whiteColor];
++    () = msg![env; this setBackgroundColor:white];
++    this
++}
++
++- (id)initWithFrame:(CGRect)frame {
++    msg![env; this initWithFrame:frame style:UITableViewStylePlain]
++}
++
++- (())dealloc {
++    clear_content(env, this);
++    let &mut UITableViewHostObject { header_view, footer_view, background_view, .. } = host(env, this);
++    release(env, header_view);
++    release(env, footer_view);
++    release(env, background_view);
++    msg_super![env; this dealloc]
++}
++
++- (UITableViewStyle)style {
++    host(env, this).style
++}
++
++- (id)dataSource {
++    host(env, this).data_source
++}
++- (())setDataSource:(id)data_source {
++    host(env, this).data_source = data_source;
++}
++
++- (CGFloat)rowHeight {
++    host(env, this).row_height
++}
++- (())setRowHeight:(CGFloat)height {
++    host(env, this).row_height = height;
++}
++- (())setSectionHeaderHeight:(CGFloat)height {
++    host(env, this).section_header_height = height;
++}
++- (())setSectionFooterHeight:(CGFloat)height {
++    host(env, this).section_footer_height = height;
++}
++
++- (())setSeparatorStyle:(NSInteger)style {
++    // TODO: draw separators between rows
++    todo_objc_setter!(this, style);
++}
++- (())setSeparatorColor:(id)color {
++    todo_objc_setter!(this, color);
++}
++
++- (())setAllowsSelection:(bool)allows {
++    host(env, this).allows_selection = allows;
++}
++- (bool)allowsSelection {
++    host(env, this).allows_selection
++}
++
++- (id)tableHeaderView {
++    host(env, this).header_view
++}
++- (())setTableHeaderView:(id)view { // UIView*
++    retain(env, view);
++    let old = std::mem::replace(&mut host(env, this).header_view, view);
++    if old != nil {
++        () = msg![env; old removeFromSuperview];
++        release(env, old);
++    }
++    relayout_if_loaded(env, this);
++}
++
++- (id)tableFooterView {
++    host(env, this).footer_view
++}
++- (())setTableFooterView:(id)view { // UIView*
++    retain(env, view);
++    let old = std::mem::replace(&mut host(env, this).footer_view, view);
++    if old != nil {
++        () = msg![env; old removeFromSuperview];
++        release(env, old);
++    }
++    relayout_if_loaded(env, this);
++}
++
++- (id)backgroundView {
++    host(env, this).background_view
++}
++- (())setBackgroundView:(id)view { // UIView*
++    retain(env, view);
++    let old = std::mem::replace(&mut host(env, this).background_view, view);
++    if old != nil {
++        () = msg![env; old removeFromSuperview];
++        release(env, old);
++    }
++    if view != nil {
++        () = msg![env; this addSubview:view];
++        pin_background(env, this);
++    }
++}
++
++- (())setContentOffset:(CGPoint)offset {
++    () = msg_super![env; this setContentOffset:offset];
++    pin_background(env, this);
++}
++
++- (())reloadData {
++    reload(env, this);
++}
++
++// Like UIKit, build the rows on first layout if reloadData wasn't called.
++- (())layoutSubviews {
++    ensure_loaded(env, this);
++}
++
++- (id)dequeueReusableCellWithIdentifier:(id)_identifier { // NSString*
++    nil
++}
++
++- (NSInteger)numberOfSections {
++    ensure_loaded(env, this);
++    host(env, this).rows.iter().map(|r| r.section + 1).max().unwrap_or(0) as NSInteger
++}
++
++- (NSInteger)numberOfRowsInSection:(NSInteger)section {
++    ensure_loaded(env, this);
++    host(env, this).rows.iter().filter(|r| r.section as NSInteger == section).count() as NSInteger
++}
++
++- (id)cellForRowAtIndexPath:(id)path { // NSIndexPath*
++    let (section, row) = index_path_parts(env, path);
++    match find_row(env, this, section, row) {
++        Some(i) => host(env, this).rows[i].cell,
++        None => nil,
++    }
++}
++
++- (id)indexPathForCell:(id)cell { // UITableViewCell*
++    let found = host(env, this).rows.iter().find(|r| r.cell == cell).map(|r| (r.section, r.row));
++    match found {
++        Some((section, row)) => index_path(env, section, row),
++        None => nil,
++    }
++}
++
++- (id)visibleCells {
++    let cells: Vec<id> = host(env, this).rows.iter().map(|r| r.cell).collect();
++    for &cell in &cells {
++        retain(env, cell);
++    }
++    let array = ns_array::from_vec(env, cells);
++    autorelease(env, array)
++}
++
++- (id)indexPathForSelectedRow {
++    match host(env, this).selected {
++        Some((section, row)) => index_path(env, section, row),
++        None => nil,
++    }
++}
++
++- (())selectRowAtIndexPath:(id)path // NSIndexPath*
++                  animated:(bool)_animated
++            scrollPosition:(UITableViewScrollPosition)position {
++    if path == nil {
++        set_selected(env, this, None);
++        return;
++    }
++    ensure_loaded(env, this);
++    let (section, row) = index_path_parts(env, path);
++    set_selected(env, this, Some((section, row)));
++    if position != UITableViewScrollPositionNone {
++        if let Some(i) = find_row(env, this, section, row) {
++            scroll_to_row(env, this, i, position);
++        }
++    }
++}
++
++- (())deselectRowAtIndexPath:(id)path // NSIndexPath*
++                    animated:(bool)_animated {
++    let parts = index_path_parts(env, path);
++    if host(env, this).selected == Some(parts) {
++        set_selected(env, this, None);
++    }
++}
++
++- (())scrollToRowAtIndexPath:(id)path // NSIndexPath*
++            atScrollPosition:(UITableViewScrollPosition)position
++                    animated:(bool)_animated {
++    ensure_loaded(env, this);
++    let (section, row) = index_path_parts(env, path);
++    if let Some(i) = find_row(env, this, section, row) {
++        scroll_to_row(env, this, i, position);
++    }
++}
++
++- (())touchesBegan:(id)touches // NSSet* of UITouch*
++         withEvent:(id)_event { // UIEvent*
++    let (_, location) = touch_location(env, this, touches);
++    let host = host(env, this);
++    host.touch_start = location;
++    host.touch_moved = false;
++}
++
++- (())touchesMoved:(id)touches // NSSet* of UITouch*
++         withEvent:(id)event { // UIEvent*
++    let (_, location) = touch_location(env, this, touches);
++    let start = host(env, this).touch_start;
++    if (location.x - start.x).hypot(location.y - start.y) > TAP_SLOP {
++        host(env, this).touch_moved = true;
++    }
++    () = msg_super![env; this touchesMoved:touches withEvent:event];
++}
++
++- (())touchesEnded:(id)touches // NSSet* of UITouch*
++         withEvent:(id)_event { // UIEvent*
++    let (touch, _) = touch_location(env, this, touches);
++    let &mut UITableViewHostObject { touch_moved, allows_selection, .. } = host(env, this);
++    if touch_moved || !allows_selection {
++        return;
++    }
++    let view: id = msg![env; touch view];
++    tap(env, this, view);
++}
++
++@end
++
++};
+diff --git a/src/frameworks/uikit/ui_view/ui_table_view_cell.rs b/src/frameworks/uikit/ui_view/ui_table_view_cell.rs
+new file mode 100644
+index 0000000..8787fc8
+--- /dev/null
++++ b/src/frameworks/uikit/ui_view/ui_table_view_cell.rs
+@@ -0,0 +1,401 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `UITableViewCell`.
++
++use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
++use crate::frameworks::foundation::NSInteger;
++use crate::objc::{
++    id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes, release,
++    retain, todo_objc_setter, ClassExports, NSZonePtr,
++};
++use crate::Environment;
++
++pub type UITableViewCellStyle = NSInteger;
++const UITableViewCellStyleDefault: UITableViewCellStyle = 0;
++const UITableViewCellStyleSubtitle: UITableViewCellStyle = 3;
++
++type UITableViewCellSelectionStyle = NSInteger;
++const UITableViewCellSelectionStyleNone: UITableViewCellSelectionStyle = 0;
++const UITableViewCellSelectionStyleBlue: UITableViewCellSelectionStyle = 1;
++
++/// Row height used by iOS 3 for plain-style cells.
++pub const DEFAULT_ROW_HEIGHT: CGFloat = 44.0;
++
++pub struct UITableViewCellHostObject {
++    superclass: super::UIViewHostObject,
++    style: UITableViewCellStyle,
++    /// `NSString*`, strong
++    reuse_identifier: id,
++    /// The following views are strong references, created lazily where iOS
++    /// does so.
++    content_view: id,
++    text_label: id,
++    detail_text_label: id,
++    image_view: id,
++    background_view: id,
++    selected_background_view: id,
++    /// Fallback highlight used when the app sets no selectedBackgroundView.
++    default_selected_background_view: id,
++    selected: bool,
++    selection_style: UITableViewCellSelectionStyle,
++}
++impl_HostObject_with_superclass!(UITableViewCellHostObject);
++impl Default for UITableViewCellHostObject {
++    fn default() -> Self {
++        UITableViewCellHostObject {
++            superclass: Default::default(),
++            style: UITableViewCellStyleDefault,
++            reuse_identifier: nil,
++            content_view: nil,
++            text_label: nil,
++            detail_text_label: nil,
++            image_view: nil,
++            background_view: nil,
++            selected_background_view: nil,
++            default_selected_background_view: nil,
++            selected: false,
++            selection_style: UITableViewCellSelectionStyleBlue,
++        }
++    }
++}
++
++fn host(env: &mut Environment, cell: id) -> &mut UITableViewCellHostObject {
++    env.objc.borrow_mut::<UITableViewCellHostObject>(cell)
++}
++
++fn bounds_rect(env: &mut Environment, view: id) -> CGRect {
++    let bounds: CGRect = msg![env; view bounds];
++    CGRect {
++        origin: CGPoint { x: 0.0, y: 0.0 },
++        size: bounds.size,
++    }
++}
++
++fn new_label(env: &mut Environment, content_view: id) -> id {
++    let label: id = msg_class![env; UILabel alloc];
++    let label: id = msg![env; label initWithFrame:(CGRect::default())];
++    let clear: id = msg_class![env; UIColor clearColor];
++    () = msg![env; label setBackgroundColor:clear];
++    () = msg![env; content_view addSubview:label];
++    label
++}
++
++/// Swaps a background-style view (one that sits behind the content view).
++fn replace_background(env: &mut Environment, this: id, old: id, new: id) {
++    if old == new {
++        return;
++    }
++    if old != nil {
++        () = msg![env; old removeFromSuperview];
++        release(env, old);
++    }
++    if new != nil {
++        retain(env, new);
++        let frame = bounds_rect(env, this);
++        () = msg![env; new setFrame:frame];
++        () = msg![env; this insertSubview:new atIndex:0];
++    }
++}
++
++/// Shows the selection highlight iff the cell is selected.
++fn update_selection_display(env: &mut Environment, this: id) {
++    let &mut UITableViewCellHostObject {
++        selected,
++        selection_style,
++        selected_background_view,
++        default_selected_background_view,
++        background_view,
++        ..
++    } = host(env, this);
++
++    let highlight = if selected_background_view != nil {
++        selected_background_view
++    } else if selection_style != UITableViewCellSelectionStyleNone {
++        if default_selected_background_view == nil {
++            let view: id = msg_class![env; UIView alloc];
++            let view: id = msg![env; view initWithFrame:(CGRect::default())];
++            let color: id = if selection_style == UITableViewCellSelectionStyleBlue {
++                msg_class![env; UIColor colorWithRed:(0.02 as CGFloat) green:(0.45 as CGFloat) blue:(0.93 as CGFloat) alpha:(1.0 as CGFloat)]
++            } else {
++                msg_class![env; UIColor colorWithWhite:(0.75 as CGFloat) alpha:(1.0 as CGFloat)]
++            };
++            () = msg![env; view setBackgroundColor:color];
++            host(env, this).default_selected_background_view = view;
++            view
++        } else {
++            default_selected_background_view
++        }
++    } else {
++        nil
++    };
++
++    if highlight == nil {
++        return;
++    }
++    if selected {
++        let frame = bounds_rect(env, this);
++        () = msg![env; highlight setFrame:frame];
++        // Above the normal background, below the content.
++        let index: NSInteger = if background_view != nil { 1 } else { 0 };
++        () = msg![env; this insertSubview:highlight atIndex:index];
++        () = msg![env; highlight setHidden:false];
++    } else {
++        () = msg![env; highlight setHidden:true];
++    }
++}
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation UITableViewCell: UIView
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::<UITableViewCellHostObject>::default();
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++- (id)initWithStyle:(UITableViewCellStyle)style
++    reuseIdentifier:(id)reuse_identifier { // NSString*
++    let frame = CGRect {
++        origin: CGPoint { x: 0.0, y: 0.0 },
++        size: CGSize { width: 320.0, height: DEFAULT_ROW_HEIGHT },
++    };
++    let this: id = msg_super![env; this initWithFrame:frame];
++    let reuse_identifier: id = msg![env; reuse_identifier copy];
++    host(env, this).style = style;
++    host(env, this).reuse_identifier = reuse_identifier;
++
++    // Before iOS 7, cells show the table view's background (Apple docs:
++    // "in earlier versions of iOS, cells inherit the background color of
++    // the enclosing table view"), so they must not paint their own.
++    let clear: id = msg_class![env; UIColor clearColor];
++    () = msg![env; this setBackgroundColor:clear];
++    () = msg![env; this setOpaque:false];
++
++    let content_view: id = msg_class![env; UIView alloc];
++    let content_view: id = msg![env; content_view initWithFrame:frame];
++    let clear: id = msg_class![env; UIColor clearColor];
++    () = msg![env; content_view setBackgroundColor:clear];
++    () = msg![env; this addSubview:content_view];
++    host(env, this).content_view = content_view;
++    this
++}
++
++// iPhone OS 2.x initializer, deprecated in 3.0 but still used by many apps.
++- (id)initWithFrame:(CGRect)frame
++    reuseIdentifier:(id)reuse_identifier { // NSString*
++    let this: id = msg![env; this initWithStyle:UITableViewCellStyleDefault
++                                reuseIdentifier:reuse_identifier];
++    () = msg![env; this setFrame:frame];
++    this
++}
++
++- (id)initWithFrame:(CGRect)frame {
++    msg![env; this initWithFrame:frame reuseIdentifier:nil]
++}
++
++- (())dealloc {
++    let &mut UITableViewCellHostObject {
++        reuse_identifier,
++        content_view,
++        text_label,
++        detail_text_label,
++        image_view,
++        background_view,
++        selected_background_view,
++        default_selected_background_view,
++        ..
++    } = host(env, this);
++    for obj in [
++        reuse_identifier,
++        content_view,
++        text_label,
++        detail_text_label,
++        image_view,
++        background_view,
++        selected_background_view,
++        default_selected_background_view,
++    ] {
++        release(env, obj);
++    }
++    msg_super![env; this dealloc]
++}
++
++- (id)reuseIdentifier {
++    host(env, this).reuse_identifier
++}
++
++- (())prepareForReuse {
++}
++
++- (id)contentView {
++    host(env, this).content_view
++}
++
++- (id)textLabel {
++    let existing = host(env, this).text_label;
++    if existing != nil {
++        return existing;
++    }
++    let content_view = host(env, this).content_view;
++    let label = new_label(env, content_view);
++    host(env, this).text_label = label;
++    () = msg![env; this setNeedsLayout];
++    label
++}
++
++- (id)detailTextLabel {
++    let existing = host(env, this).detail_text_label;
++    if existing != nil || host(env, this).style == UITableViewCellStyleDefault {
++        // The default style has no detail label on iOS either.
++        return existing;
++    }
++    let content_view = host(env, this).content_view;
++    let label = new_label(env, content_view);
++    host(env, this).detail_text_label = label;
++    () = msg![env; this setNeedsLayout];
++    label
++}
++
++- (id)imageView {
++    let existing = host(env, this).image_view;
++    if existing != nil {
++        return existing;
++    }
++    let image_view: id = msg_class![env; UIImageView alloc];
++    let image_view: id = msg![env; image_view initWithFrame:(CGRect::default())];
++    let content_view = host(env, this).content_view;
++    () = msg![env; content_view addSubview:image_view];
++    host(env, this).image_view = image_view;
++    image_view
++}
++
++// iPhone OS 2.x-style convenience accessors.
++- (())setText:(id)text { // NSString*
++    let label: id = msg![env; this textLabel];
++    () = msg![env; label setText:text];
++}
++- (())setImage:(id)image { // UIImage*
++    let image_view: id = msg![env; this imageView];
++    () = msg![env; image_view setImage:image];
++    () = msg![env; this setNeedsLayout];
++}
++
++- (id)backgroundView {
++    host(env, this).background_view
++}
++- (())setBackgroundView:(id)new_view { // UIView*
++    let old = std::mem::replace(&mut host(env, this).background_view, new_view);
++    replace_background(env, this, old, new_view);
++}
++
++- (id)selectedBackgroundView {
++    host(env, this).selected_background_view
++}
++- (())setSelectedBackgroundView:(id)new_view { // UIView*
++    let old = std::mem::replace(&mut host(env, this).selected_background_view, new_view);
++    replace_background(env, this, old, new_view);
++    update_selection_display(env, this);
++}
++
++- (bool)isSelected {
++    host(env, this).selected
++}
++- (())setSelected:(bool)selected {
++    msg![env; this setSelected:selected animated:false]
++}
++- (())setSelected:(bool)selected animated:(bool)_animated {
++    host(env, this).selected = selected;
++    update_selection_display(env, this);
++}
++- (())setHighlighted:(bool)highlighted animated:(bool)_animated {
++    todo_objc_setter!(this, highlighted);
++}
++
++- (UITableViewCellSelectionStyle)selectionStyle {
++    host(env, this).selection_style
++}
++- (())setSelectionStyle:(UITableViewCellSelectionStyle)style {
++    host(env, this).selection_style = style;
++    update_selection_display(env, this);
++}
++
++- (())setAccessoryType:(NSInteger)accessory_type {
++    // TODO: draw disclosure indicators/checkmarks
++    todo_objc_setter!(this, accessory_type);
++}
++- (())setAccessoryView:(id)accessory_view {
++    todo_objc_setter!(this, accessory_view);
++}
++
++- (())layoutSubviews {
++    let bounds = bounds_rect(env, this);
++    let &mut UITableViewCellHostObject {
++        style,
++        content_view,
++        text_label,
++        detail_text_label,
++        image_view,
++        background_view,
++        selected_background_view,
++        default_selected_background_view,
++        ..
++    } = host(env, this);
++    for view in [background_view, selected_background_view, default_selected_background_view] {
++        if view != nil {
++            () = msg![env; view setFrame:bounds];
++        }
++    }
++    if content_view == nil {
++        return;
++    }
++    () = msg![env; content_view setFrame:bounds];
++
++    let margin: CGFloat = 10.0;
++    let mut text_x = margin;
++    if image_view != nil {
++        let image: id = msg![env; image_view image];
++        if image != nil {
++            let size: CGSize = msg![env; image size];
++            let frame = CGRect {
++                origin: CGPoint { x: margin, y: (bounds.size.height - size.height) / 2.0 },
++                size,
++            };
++            () = msg![env; image_view setFrame:frame];
++            text_x = margin * 2.0 + size.width;
++        }
++    }
++    let text_width = (bounds.size.width - text_x - margin).max(0.0);
++    let has_detail_below = style == UITableViewCellStyleSubtitle && detail_text_label != nil;
++    if text_label != nil {
++        let height = if has_detail_below { bounds.size.height * 0.55 } else { bounds.size.height };
++        let frame = CGRect {
++            origin: CGPoint { x: text_x, y: 0.0 },
++            size: CGSize { width: text_width, height },
++        };
++        () = msg![env; text_label setFrame:frame];
++    }
++    if detail_text_label != nil {
++        let frame = if has_detail_below {
++            CGRect {
++                origin: CGPoint { x: text_x, y: bounds.size.height * 0.55 },
++                size: CGSize { width: text_width, height: bounds.size.height * 0.45 },
++            }
++        } else {
++            // Value1/Value2: detail on the right half.
++            CGRect {
++                origin: CGPoint { x: text_x + text_width / 2.0, y: 0.0 },
++                size: CGSize { width: text_width / 2.0, height: bounds.size.height },
++            }
++        };
++        () = msg![env; detail_text_label setFrame:frame];
++    }
++}
++
++@end
++
++};
+diff --git a/src/frameworks/uikit/ui_view_controller.rs b/src/frameworks/uikit/ui_view_controller.rs
+index d0a73bc..c8fa058 100644
+--- a/src/frameworks/uikit/ui_view_controller.rs
++++ b/src/frameworks/uikit/ui_view_controller.rs
+@@ -23,6 +23,7 @@ use crate::objc::{
+ use crate::Environment;
+ 
+ pub mod ui_navigation_controller;
++pub mod ui_table_view_controller;
+ 
+ #[derive(Default)]
+ struct UIViewControllerHostObject {
+diff --git a/src/frameworks/uikit/ui_view_controller/ui_table_view_controller.rs b/src/frameworks/uikit/ui_view_controller/ui_table_view_controller.rs
+new file mode 100644
+index 0000000..1d856d4
+--- /dev/null
++++ b/src/frameworks/uikit/ui_view_controller/ui_table_view_controller.rs
+@@ -0,0 +1,77 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `UITableViewController`.
++
++use crate::frameworks::core_graphics::CGRect;
++use crate::frameworks::foundation::NSInteger;
++use crate::objc::{
++    id, impl_HostObject_with_superclass, msg, msg_class, nil, objc_classes, ClassExports,
++    NSZonePtr,
++};
++
++#[derive(Default)]
++struct UITableViewControllerHostObject {
++    superclass: super::UIViewControllerHostObject,
++    /// `UITableViewStyle`
++    style: NSInteger,
++}
++impl_HostObject_with_superclass!(UITableViewControllerHostObject);
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation UITableViewController: UIViewController
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::<UITableViewControllerHostObject>::default();
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++- (id)initWithStyle:(NSInteger)style { // UITableViewStyle
++    let this: id = msg![env; this initWithNibName:nil bundle:nil];
++    env.objc.borrow_mut::<UITableViewControllerHostObject>(this).style = style;
++    this
++}
++
++- (id)init {
++    msg![env; this initWithStyle:(0 as NSInteger)]
++}
++
++- (())loadView {
++    let style = env.objc.borrow::<UITableViewControllerHostObject>(this).style;
++    let screen: id = msg_class![env; UIScreen mainScreen];
++    let frame: CGRect = msg![env; screen applicationFrame];
++    let table: id = msg_class![env; UITableView alloc];
++    let table: id = msg![env; table initWithFrame:frame style:style];
++    () = msg![env; table setDelegate:this];
++    () = msg![env; table setDataSource:this];
++    () = msg![env; this setView:table];
++    crate::objc::release(env, table);
++}
++
++// The table view *is* the root view.
++- (id)tableView {
++    msg![env; this view]
++}
++- (())setTableView:(id)table { // UITableView*
++    () = msg![env; this setView:table];
++}
++
++- (())setClearsSelectionOnViewWillAppear:(bool)_clears {
++}
++
++// Default data source: an empty table.
++- (NSInteger)tableView:(id)_table numberOfRowsInSection:(NSInteger)_section {
++    0
++}
++- (id)tableView:(id)_table cellForRowAtIndexPath:(id)_path {
++    nil
++}
++
++@end
++
++};

@@ -1,0 +1,15 @@
+# Game file (copyrighted) — download it, see README
+*.ipa
+
+# touchHLE checkout/build created by ./setup.sh
+touchHLE
+
+# Unzipped game bundle (regenerable from the .ipa)
+extracted/
+
+# Converted game art; regenerate with:
+#   unzip -q -o "HarborMaster Decrypted.ipa" -d extracted
+#   python3 tools/uncgbi.py extracted/Payload/HarborMaster.app assets
+assets/
+
+__pycache__/
