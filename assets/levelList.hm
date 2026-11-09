@@ -1,0 +1,162 @@
+numberOfPorts 7
+portId 1
+portServerId HM000001
+portIsDLC 0
+portName Fishing Bay
+portFile level1.hm
+portLocaton 285.0 135.0
+portLabelFile levelLabelFishingBay.png
+portLabelLocation 338.0 128.0
+portMinCargo 0
+gameCenterId HMFishingBay
+skillLevelCount 6
+0
+0 10
+1
+10 25
+2
+25 50
+3
+50 100
+4
+100 150
+5
+150 999999
+portId 2
+portServerId HM000002
+portIsDLC 0
+portName Cyclone Island
+portFile level2.hm
+portLocaton 110.0 145.0
+portLabelFile levelLabelCycloneIsland.png
+portLabelLocation 163.0 138.0
+portMinCargo 0
+gameCenterId HMCycloneIsland
+skillLevelCount 6
+0
+0 10
+1
+10 25
+2
+25 50
+3
+50 100
+4
+100 150
+5
+150 999999
+portId 3
+portServerId HM000003
+portIsDLC 0
+portName Sturgeon Creek
+portFile level3.hm
+portLocaton 390.0 190.0
+portLabelFile levelLabelSturgeonCreek.png
+portLabelLocation 443.0 183.0
+portMinCargo 0
+gameCenterId HMSturgeonCreek
+skillLevelCount 6
+0
+0 10
+1
+10 25
+2
+25 50
+3
+50 100
+4
+100 150
+5
+150 999999
+portId 4
+portServerId HM000004
+portIsDLC 0
+portName Cannon Beach
+portFile level4.hm
+portLocaton 315.0 210.0
+portLabelFile levelLabelCannonBeach.png
+portLabelLocation 262.0 203.0
+portMinCargo 0
+gameCenterId HMCannonBeach
+skillLevelCount 6
+0
+0 10
+1
+10 25
+2
+25 50
+3
+50 100
+4
+100 150
+5
+150 999999
+portId 5
+portServerId HM000005
+portIsDLC 0
+portName Smugglers' Reef
+portFile level5.hm
+portLocaton 215.0 245.0
+portLabelFile levelLabelSmugglersReef.png
+portLabelLocation 152.0 238.0
+portMinCargo 0
+gameCenterId HMSmugglersReef
+skillLevelCount 6
+0
+0 10
+1
+10 25
+2
+25 50
+3
+50 100
+4
+100 150
+5
+150 999999
+portId 6
+portServerId HM000006
+portIsDLC 0
+portName Monster Cove
+portFile level6.hm
+portLocaton 395.0 120.0
+portLabelFile levelLabelMonsterCove.png
+portLabelLocation 448.0 112.0
+portMinCargo 0
+gameCenterId HMMonsterCove
+skillLevelCount 6
+0
+0 10
+1
+10 25
+2
+25 50
+3
+50 100
+4
+100 150
+5
+150 999999
+portId 7
+portServerId HM000007
+portIsDLC 0
+portName Cargo City
+portFile level7.hm
+portLocaton 395.0 120.0
+portLabelFile levelLabelMonsterCove.png
+portLabelLocation 448.0 112.0
+portMinCargo 0
+gameCenterId HMCargoCity
+skillLevelCount 6
+0
+0 10
+1
+10 25
+2
+25 50
+3
+50 100
+4
+100 150
+5
+150 999999

@@ -1,0 +1,93 @@
+textureElement land monsterCoveTexture.png 0 0 0
+shouldDrawLandCollisionRegions 0
+shouldDrawObjectCollisionRegions 0
+mapSize 480.0 320.0
+stressLevel 0.0
+stressThreshold 0.40
+stressSustainTime 80.0
+stressRestThreshold 0.3
+stressSpawnThreshold 0.1
+stressRelaxTime 2.0
+stressNewBoatUnknown 0.2
+stressNewBoatSmall 0.15
+stressNewBoatMedium 0.1
+stressNewBoatLarge 0.15
+stressWarning 0.05
+stressDocksFull 0.1
+stressCyclone 0.0
+stressMonster 0.1
+timeBetweenBoats 3.0
+timeSinceLastBoat 0.5
+maxSmallBoats 999
+maxMediumBoats 2
+maxLargeBoats 1
+maxMonsters 0
+monsterSpawnOdds 20
+timeBetweenMonsters 30.0
+cargoTypes 1
+allowMultiCargoBoats 0
+pacingElement
+0 16
+4.0 1 0 999 2 1 0 0 1
+pacingElement
+16 32
+4.0 1 0 999 2 1 0 0 1
+pacingElement
+32 64
+3.0 1 0 999 2 2 0 0 1
+pacingElement
+64 999999
+3.0 1 0 999 3 2 0 0 1
+pacingElementMultiplayer
+0 16
+4.0 1 0 999 2 1 0 0 1
+pacingElementMultiplayer
+16 32
+4.0 1 0 999 2 1 0 0 1
+pacingElementMultiplayer
+32 64
+3.0 1 0 999 2 2 0 0 1
+pacingElementMultiplayer
+64 999999
+3.0 1 0 999 3 2 0 0 1
+landElement 
+4
+240 60
+128 22
+128 -22
+240 -50
+landElement 
+5
+85 160
+0 135
+-160 110
+-240 125
+-240 160
+landElement 
+5
+85 -160
+0 -135
+-160 -110
+-240 -125
+-240 -160
+dockElement
+140 277
+100.0
+0
+1.0
+1
+0
+dockElement
+139 45
+260.0
+0
+1.0
+1
+0
+dockElement
+365 160
+0.0
+0
+4.0
+1
+0

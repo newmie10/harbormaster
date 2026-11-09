@@ -36,6 +36,7 @@ first).
 | `patches/touchhle-harbormaster.patch` | All touchHLE changes (15 files) |
 | `play.sh` | Launches the game with the right options |
 | `tools/uncgbi.py` | Converts the app's Apple "CgBI" PNGs into normal PNGs, to look at the art (not needed to play) |
+| `assets/` | The game's images (converted to normal PNGs), sounds, sprite atlas and map files, for reference (not needed to play) |
 
 ## What it took: issues and fixes
 
@@ -139,6 +140,7 @@ Fix: an actual UIKit-style deferred layout pass:
 
 ## Legal
 
-Harbor Master is © Imangi Studios. This repo contains no game code or art. It
-only contains emulator patches and scripts. You provide the `.ipa` yourself.
+Harbor Master is © Imangi Studios. `assets/` contains the game's art, sounds and
+map data, extracted for reference. This repo contains no game code; you provide
+the `.ipa` yourself.
 touchHLE is MPL-2.0, and the patch is a derivative of it.

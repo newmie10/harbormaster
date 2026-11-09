@@ -1,0 +1,84 @@
+textureElement land islandTexture.png 0 0 0
+shouldDrawLandCollisionRegions 0
+shouldDrawObjectCollisionRegions 0
+mapSize 480.0 320.0
+stressLevel 0.0
+stressThreshold 0.25
+stressSustainTime 80.0
+stressRestThreshold 0.3
+stressSpawnThreshold 0.1
+stressRelaxTime 2.0
+stressNewBoatUnknown 0.2
+stressNewBoatSmall 0.15
+stressNewBoatMedium 0.1
+stressNewBoatLarge 0.15
+stressWarning 0.05
+stressDocksFull 0.1
+stressCyclone 0.0
+timeBetweenBoats 3.0
+timeSinceLastBoat 0.5
+maxSmallBoats 999
+maxMediumBoats 0
+maxLargeBoats 0
+maxCyclones 0
+cycloneSpawnOdds 25
+timeBetweenCyclones 5.0
+cargoTypes 1
+pacingElement
+0 6
+5.0 1 0 999 0 0 0 0 0
+pacingElement
+6 16
+4.0 1 0 999 2 0 1 0 0
+pacingElement
+16 32
+4.0 1 0 999 2 1 1 0 0
+pacingElement
+32 64
+3.0 1 0 999 2 2 2 0 0
+pacingElement
+64 999999
+3.0 1 0 999 3 2 2 0 0
+pacingElementMultiplayer
+0 6
+5.0 1 0 999 1 0 0 0 0
+pacingElementMultiplayer
+6 16
+4.0 1 0 999 2 1 1 0 0
+pacingElementMultiplayer
+16 32
+4.0 1 0 999 2 2 1 0 0
+pacingElementMultiplayer
+32 64
+3.0 1 0 999 2 2 2 0 0
+pacingElementMultiplayer
+64 999999
+3.0 1 0 999 3 2 2 0 0
+landElement 
+5
+0 66
+62 11
+43 -51
+-43 -51
+-62 11
+dockElement
+240 110
+90.0
+0
+1.0
+1
+0
+dockElement
+201 190
+-45.0
+0
+1.0
+1
+0
+dockElement
+279 190
+-135.0
+0
+1.0
+1
+0
